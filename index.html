@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdn.jsdelivr.net/npm/pako@1.0.11/dist/pako_inflate.min.js" ></script>
+    <script src="https://bundle.run/buffer@6.0.3"></script>
+    <script src="inspect.js"></script> 
+    <script src="cbor.js"></script> 
+    <script src="https://cdn.jsdelivr.net/npm/js-base64@3.6.1/base64.min.js"></script>
+    <script src="cose.js"></script> 
+    <script src="base45.js"></script> 
+    <script src="certs.js"></script> 
+</head>
+
+<body>
+
+QR code raw data: <input id="input" type="text"><button id="button">Verify</button>
+<pre id="json"></pre>
+
+
+<script>
+var Buffer = buffer.Buffer;
+var decodeb64 = Base64.toUint8Array;
+
+const COSE_HEADERS = Object.freeze({
+	KID: 4
+});
+
+// As per https://ec.europa.eu/health/sites/default/files/ehealth/docs/digital-green-certificates_v3_en.pdf
+// Section 2.6.3
+const CWT_CLAIMS = Object.freeze({
+	ISSUER: 1,
+	EXPIRATION: 4,
+	ISSUED_AT: 6,
+	HCERT: -260
+});
+
+
+
+
+async function unsafeDGCFromCoseData(rawCoseData){
+	// COSE is just some CBOR-serialized data.
+	const coseData = await cbor.decodeFirst(rawCoseData);
+	const coseValue = coseData?.value;
+	if (!coseValue || !Array.isArray(coseValue) || coseValue.length !== 4) {
+		throw Error('Unexpected COSE data. DGC is probably invalid.');
+	}
+	const [phdrsData, _uhdrs, cosePayload, _signers] = coseValue;
+
+	// Extract the KID and the payload
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const phdrs = await cbor.decodeFirst(phdrsData);
+	const rawKid = phdrs.get(COSE_HEADERS.KID);
+	if (!rawKid) {
+		throw Error('Cannot find a KID in COSE Data. DGC is probably invalid.');
+	}
+	const kid = Buffer.from(rawKid).toString('base64');
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const cborData = await cbor.decodeFirst(cosePayload);
+
+	// Validate the payload against the JSON schema.
+	const hcert = cborData.get(CWT_CLAIMS.HCERT)?.get(1) || {};
+	// const ajv = new Ajv();
+	// // Enhance the validator with their custom properties:
+	// const dateValidator = (s) => !isNaN(Date.parse(s));
+	// ajv.addFormat('date', dateValidator);
+	// ajv.addFormat('date-time', dateValidator);
+	// ajv.addKeyword('valueset-uri'); // We won't validate that.
+	// const hcertValid = ajv.validate(DCCSchema, hcert);
+	// if (!hcertValid) {
+	// 	const validationErrors = ajv.errors?.map((err) => err.message).join('\n');
+	// 	throw Error(`DGC validation failed:\n${validationErrors}.`);
+	// }
+
+	return {
+		hcert,
+		kid,
+		issuer: cborData.get(CWT_CLAIMS.ISSUER) || null,
+		issuedAt: cborData.get(CWT_CLAIMS.ISSUED_AT) || null,
+		expiresAt: cborData.get(CWT_CLAIMS.EXPIRATION) || null
+	};
+}
+
+/**
+ * Verifies the CWT claims of the DGC.
+ */
+async function verifyDGCClaims(dgc){
+	const now = Math.floor(Date.now() / 1000);
+
+	if (dgc.issuedAt !== null && now < dgc.issuedAt) throw new DgcIssuedInFutureError(dgc);
+
+	if (dgc.expiresAt !== null && dgc.expiresAt < now) throw new ExpiredDgcError(dgc);
+}
+
+/**
+ * Find the DSC that matches this DSC KID.
+ */
+function findDGCPublicKey(dgc) {
+	// Find the KID in known DSCs
+	if (!(dgc.kid in DCCCerts)) throw new UnknownKidError(dgc);
+	const certificate = DCCCerts[dgc.kid];
+	const notAfter = new Date(certificate.notAfter);
+	const notBefore = new Date(certificate.notBefore);
+	// Verify that the certificate is still valid.
+	const now = new Date();
+	if (now > notAfter || now < notBefore) throw new InvalidCertificateError(dgc);
+	return certificate;
+}
+
+async function getCertificatePublicKey({
+	publicKeyAlgorithm,
+	publicKeyPem
+}) {
+	const der = decodeb64(publicKeyPem);
+	const public_key = await crypto.subtle.importKey('spki', der, publicKeyAlgorithm, true, [
+		'verify'
+	]);
+	return public_key;
+}
+/**
+ * Verify that the DGC is authentic:
+ *   - Check that the certificate is still valid
+ *   - Check the COSE signature
+ *   - Check the CWT claims
+ */
+async function verifyDGC(dgc, rawCoseData, code){
+	await verifyDGCClaims(dgc);
+	const certificate = findDGCPublicKey(dgc);
+	const key = await getCertificatePublicKey(certificate);
+	await verify(rawCoseData, { key });
+	return { ...dgc, certificate, code };
+}
+
+
+function getCertificateInfo(cert) {
+	const hcert = cert.hcert;
+	const common = {
+		first_name: hcert.nam.gn || (hcert.nam.gnt || '-').replace(/</g, ' '),
+		last_name: hcert.nam.fn || hcert.nam.fnt.replace(/</g, ' '),
+		date_of_birth: new Date(hcert.dob),
+		code: cert.code,
+		source: { format: 'dgc', cert }
+	};
+	if (hcert.v && hcert.v.length) {
+		return {
+			type: 'vaccination',
+			vaccination_date: new Date(hcert.v[0].dt),
+			prophylactic_agent: hcert.v[0].vp,
+			doses_received: hcert.v[0].dn,
+			doses_expected: hcert.v[0].sd,
+			...common
+		};
+	}
+	if (hcert.t && hcert.t.length) {
+		return {
+			type: 'test',
+			test_date: new Date(hcert.t[0].sc),
+			// 260415000=not detected: http://purl.bioontology.org/ontology/SNOMEDCT/260415000
+			is_negative: hcert.t[0].tr === '260415000',
+			...common
+		};
+	}
+	if (hcert.r && hcert.r.length) {
+		return {
+			type: 'test',
+			test_date: new Date(hcert.r[0].fr), // date of positive test
+			is_negative: false,
+			...common
+		};
+	}
+	throw new Error('Unsupported or empty certificate: ' + JSON.stringify(cert));
+}
+
+
+
+function verify(){
+    let doc = document.getElementById('input').value;
+    let coseData;
+    try {
+        coseData = decode(doc);
+    } catch (err) {
+        document.getElementById('json').innerHTML = 'Invalid input';
+        return;
+    }
+
+    try {
+        coseData = pako.inflate(coseData);
+    } catch (err) {
+        // Probably not ZLIBed, that's OK
+    }
+
+    console.log(coseData);
+
+
+    (async function(){
+        const unsafe_dgc = await unsafeDGCFromCoseData(coseData);
+        console.log(unsafe_dgc);
+
+        const dgc = await verifyDGC(unsafe_dgc, coseData, doc);
+        console.log(dgc);
+        const c = getCertificateInfo(dgc);
+        console.log(c);
+
+        document.getElementById('json').innerHTML = JSON.stringify(dgc, null, 4);
+    })();    
+}
+
+
+
+document.getElementById('input').addEventListener('change', verify, false);
+document.getElementById('button').addEventListener('click', verify, false);
+
+
+</script>
+
+</body>
+</html>
