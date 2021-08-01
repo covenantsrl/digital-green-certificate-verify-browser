@@ -172,8 +172,13 @@ function getCertificateInfo(cert) {
 
 
 
-function verify(){
+function _verify(){
     let doc = document.getElementById('input').value;
+    if (doc.startsWith('HC1')){
+    	doc = doc.substr(3);
+    	if (doc.startsWith(':'))
+    		doc = doc.substr(1);
+    }
     let coseData;
     try {
         coseData = decode(doc);
@@ -206,8 +211,7 @@ function verify(){
 
 
 
-document.getElementById('input').addEventListener('change', verify, false);
-document.getElementById('button').addEventListener('click', verify, false);
+document.getElementById('button').addEventListener('click', _verify, false);
 
 
 </script>
